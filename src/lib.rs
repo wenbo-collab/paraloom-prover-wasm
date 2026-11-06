@@ -45,6 +45,22 @@ fn hex32(s: &str) -> Result<[u8; 32], JsValue> {
     Ok(o)
 }
 
+/// Deserialize a proving key, rejecting any trailing bytes (#1412).
+/// `deserialize_compressed` consumes only the bytes it needs from the slice
+/// and never checks that the cursor is exhausted, so a corrupted or
+/// concatenated key file (e.g. two keys `cat`ed together) would otherwise load
+/// silently and prove under a key the operator did not intend. Fails closed:
+/// the whole slice must be exactly one key.
+fn load_proving_key(proving_key: &[u8]) -> Result<ProvingKey<Bn254>, String> {
+    let mut cursor = &proving_key[..];
+    let pk = ProvingKey::<Bn254>::deserialize_compressed(&mut cursor)
+        .map_err(|e| format!("bad proving key: {e}"))?;
+    if !cursor.is_empty() {
+        return Err("bad proving key: trailing bytes".to_string());
+    }
+    Ok(pk)
+}
+
 /// Poseidon commitment for a note `(amount, randomness, recipient)`, hex. The
 /// wallet needs this to look up the note's Merkle path from the path server.
 #[wasm_bindgen]
@@ -217,8 +233,7 @@ pub fn prove_withdrawal_v2(
         input_path: Some(merkle_path),
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = load_proving_key(proving_key).map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<WithdrawCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -358,8 +373,7 @@ pub fn prove_transfer_v2(
         asset_id,
     );
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = load_proving_key(proving_key).map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<TransferCircuitV2, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -602,8 +616,7 @@ pub fn prove_transact(
         out_blindings,
     };
 
-    let pk = ProvingKey::<Bn254>::deserialize_compressed(proving_key)
-        .map_err(|e| JsValue::from_str(&format!("bad proving key: {e}")))?;
+    let pk = load_proving_key(proving_key).map_err(|e| JsValue::from_str(&e))?;
     let proof =
         Groth16ProofSystem::prove::<TransactCircuitV3, _>(&pk, circuit, &mut rng_from_entropy())
             .map_err(|e| JsValue::from_str(&format!("prove failed: {e}")))?;
@@ -688,4 +701,56 @@ pub fn v3_merkle_path(leaves_json: &str, leaf_index: u32) -> Result<String, JsVa
         serde_json::to_string(&path).unwrap(),
         hex::encode(fr_to_le_bytes_32(root))
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_bn254::G1Affine;
+    use ark_groth16::VerifyingKey;
+
+    /// A structurally valid proving key (default VK, identity points, empty
+    /// query vectors) serialized exactly the way a real key file is. It proves
+    /// nothing — it exists so the trailing-byte guard can be tested without
+    /// the gitignored ceremony keys.
+    fn valid_key_bytes() -> Vec<u8> {
+        let pk = ProvingKey::<Bn254> {
+            vk: VerifyingKey::default(),
+            beta_g1: G1Affine::default(),
+            delta_g1: G1Affine::default(),
+            a_query: Vec::new(),
+            b_g1_query: Vec::new(),
+            b_g2_query: Vec::new(),
+            h_query: Vec::new(),
+            l_query: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        pk.serialize_compressed(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn load_proving_key_accepts_exact_key_bytes() {
+        let bytes = valid_key_bytes();
+        assert!(load_proving_key(&bytes).is_ok());
+    }
+
+    #[test]
+    fn load_proving_key_rejects_trailing_bytes() {
+        let mut bytes = valid_key_bytes();
+        // The issue's PoC: one garbage byte appended to an otherwise valid key.
+        bytes.push(0xFF);
+        let err = load_proving_key(&bytes).expect_err("trailing bytes must fail closed");
+        assert_eq!(err, "bad proving key: trailing bytes");
+    }
+
+    #[test]
+    fn load_proving_key_rejects_garbage() {
+        let err = load_proving_key(b"not a proving key")
+            .expect_err("garbage bytes must fail closed");
+        assert!(
+            err.starts_with("bad proving key:"),
+            "expected a bad-proving-key error, got: {err}"
+        );
+    }
 }
